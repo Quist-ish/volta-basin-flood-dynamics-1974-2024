@@ -1,0 +1,200 @@
+// Load Ghana boundaries
+//var ghana = ee.FeatureCollection("FAO/GAUL/2015/level0")
+//  .filter(ee.Filter.eq('ADM0_NAME', 'Ghana'));
+
+// Load JRC Global Surface Water
+//var jrcWater = ee.ImageCollection("JRC/GSW1_4/YearlyHistory");
+
+// Time periods to analyze
+var timePeriods = [
+  {start: 1993, end: 1995},
+  {start: 2012, end: 2015},
+  {start: 2023, end: 2024}
+];
+
+// Function to get appropriate Landsat collection for a time period
+function getLandsatCollection(startYear, endYear) {
+  var landsatCollections = [];
+  
+  for (var year = startYear; year <= endYear; year++) {
+    var startDate = ee.Date.fromYMD(year, 1, 1);
+    var endDate = ee.Date.fromYMD(year, 12, 31);
+    
+    if (year >= 2021) {
+      landsatCollections.push(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+        .filterDate(startDate, endDate));
+    }
+    if (year >= 2013 && year <= 2023) {
+      landsatCollections.push(ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+        .filterDate(startDate, endDate));
+    }
+    if (year >= 1999 && year <= 2022) {
+      landsatCollections.push(ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+        .filterDate(startDate, endDate));
+    }
+    if (year >= 1984 && year <= 2011) {
+      landsatCollections.push(ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+        .filterDate(startDate, endDate));
+    }
+  }
+  
+  // Merge all collections
+  var merged = ee.ImageCollection(landsatCollections[0]);
+  for (var i = 1; i < landsatCollections.length; i++) {
+    merged = merged.merge(landsatCollections[i]);
+  }
+  return merged;
+}
+
+// Flood detection function for entire Ghana
+function detectFloods(startYear, endYear) {
+  // Get Landsat collection for period
+  var landsatCol = getLandsatCollection(startYear, endYear)
+    .filterBounds(ghana)
+    .filter(ee.Filter.lt('CLOUD_COVER', 50));
+  
+  print('Landsat images found for');
+
+  // Function to determine NDWI bands based on spacecraft ID
+  var getNDWIBands = function(image) {
+    var spacecraftId = ee.String(image.get('SPACECRAFT_ID'));
+    var isL8orL9 = spacecraftId.match('LANDSAT_8|LANDSAT_9').length().gt(0);
+    return ee.List(ee.Algorithms.If(isL8orL9, ['SR_B3', 'SR_B5'], ['SR_B2', 'SR_B4']));
+  };
+
+  // Calculate NDWI for each image
+  var ndwi = landsatCol.map(function(image) {
+    var bands = getNDWIBands(image);
+    return image.normalizedDifference(bands).rename('flood');
+  });
+
+  // Create annual composite
+  var annualComposite = ndwi.mean().clip(ghana);
+  
+  // Threshold for water
+  var floodMask = annualComposite.gt(0.2).selfMask();
+  
+  // Mask permanent water bodies
+  var jrcComposite = jrcWater.filterDate(ee.Date(startYear + '-01-01'), 
+                                ee.Date(endYear + '-12-31'))
+                           .mean()
+                           .clip(ghana);
+  var permanentWater = jrcComposite.gte(2);
+  var floodOnly = floodMask.where(permanentWater, 0).selfMask();
+  
+  // Add to map
+  Map.addLayer(floodOnly, 
+    {palette: ['blue'], min: 0, max: 1}, 
+    'Floods ' + startYear + '-' + endYear);
+  
+  // Calculate flood statistics
+  var stats = floodOnly.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: ghana,
+    scale: 30,
+    maxPixels: 1e9
+  });
+  
+  // Export results
+  Export.image.toDrive({
+    image: floodOnly.unmask(0),
+    description: 'Ghana_Floods_' + startYear + '_' + endYear,
+    scale: 30,
+    region: ghana,
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF'
+  });
+  
+  return {
+    image: floodOnly,
+    stats: stats,
+    period: startYear + '-' + endYear
+  };
+}
+
+// Process all time periods for Ghana
+var floodResults = [];
+timePeriods.forEach(function(period) {
+  var result = detectFloods(period.start, period.end);
+  floodResults.push(result);
+  
+  // Print flood area statistics
+  if (result.stats) {
+    var floodArea = result.stats.get('flood');
+    print('Flooded area for ' + period.start + '-' + period.end + ':');
+  }
+});
+
+// SAR flood detection for recent periods
+function detectSARFloods(startYear, endYear) {
+  var sarCol = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(ghana)
+    .filterDate(ee.Date(startYear + '-01-01'), ee.Date(endYear + '-12-31'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    .filter(ee.Filter.eq('instrumentMode', 'IW'));
+  
+  print('SAR images found for');
+  
+  if (sarCol.size().getInfo() === 0) {
+    print('No SAR data available for');
+    return null;
+  }
+  
+  var floodMask = sarCol.median()
+    .select('VH')
+    .lt(-18)  // Flood threshold for VH band
+    .selfMask()
+    .clip(ghana);
+  
+  Map.addLayer(floodMask, {palette: 'red'}, 
+    'SAR Floods ' + startYear + '-' + endYear);
+  
+  Export.image.toDrive({
+    image: floodMask.unmask(0),
+    description: 'Ghana_SAR_Floods_' + startYear + '_' + endYear,
+    scale: 10,
+    region: ghana,
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF'
+  });
+  
+  return floodMask;
+}
+
+// Process SAR for recent periods
+timePeriods.slice(1).forEach(function(period) { // Skip 1993-1995 (no SAR)
+  detectSARFloods(period.start, period.end);
+});
+
+// Add Ghana boundary to map
+Map.centerObject(ghana, 6);
+Map.addLayer(ghana, {color: 'black'}, 'Ghana Boundaries');
+
+// Add legend
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '8px',
+    backgroundColor: 'white'
+  }
+});
+
+var makeLegendItem = function(color, label) {
+  return ui.Panel({
+    widgets: [
+      ui.Label({
+        value: '■',
+        style: {color: color, padding: '0 4px', fontSize: '20px'}
+      }),
+      ui.Label(label)
+    ],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+};
+
+legend.add(ui.Label('Flood Detection Legend', {fontWeight: 'bold'}));
+legend.add(makeLegendItem('blue', 'Landsat Floods'));
+legend.add(makeLegendItem('red', 'SAR Floods'));
+
+Map.add(legend);
+

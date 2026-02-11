@@ -1,0 +1,208 @@
+// =============================
+// Flood Detection in Ghana (1974–2024) every 10 years
+// =============================
+
+// Define Ghana as Area of Interest
+//var aoi = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+  //            .filter(ee.Filter.eq('country_na', 'Ghana'));
+
+// Function to get the proper image collection for a given year
+function getCollection(year) {
+  var startDate = ee.Date.fromYMD(year, 1, 1);
+  var endDate = ee.Date.fromYMD(year, 12, 31);
+  
+  if (year < 1984) {
+    return ee.ImageCollection("LANDSAT/LM01/C02/T1")
+             .filterDate(startDate, endDate)
+             .filterBounds(aoi);
+  } else if (year < 1999) {
+    return ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+             .filterDate(startDate, endDate)
+             .filterBounds(aoi)
+             .filter(ee.Filter.lt('CLOUD_COVER', 30));
+  } else if (year < 2013) {
+    return ee.ImageCollection("LANDSAT/LE07/C02/T1_L2")
+             .filterDate(startDate, endDate)
+             .filterBounds(aoi)
+             .filter(ee.Filter.lt('CLOUD_COVER', 30));
+  } else {
+    var l8 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+               .filterDate(startDate, endDate)
+               .filterBounds(aoi)
+               .filter(ee.Filter.lt('CLOUD_COVER', 30));
+    var l9 = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
+               .filterDate(startDate, endDate)
+               .filterBounds(aoi)
+               .filter(ee.Filter.lt('CLOUD_COVER', 30));
+    return l8.merge(l9);
+  }
+}
+
+// Function to compute NDWI with proper band selection
+function computeNDWI(image, year) {
+  var green, nir;
+  
+  if (year < 1984) { // MSS
+    green = image.select('B2');  // MSS Band 2 (0.5-0.6 µm)
+    nir = image.select('B4');    // MSS Band 4 (0.8-1.1 µm)
+  } else if (year < 2013) { // TM/ETM+
+    green = image.select('SR_B2'); // Green band
+    nir = image.select('SR_B4');   // NIR band
+  } else { // OLI
+    green = image.select('SR_B3'); // Green band
+    nir = image.select('SR_B5');   // NIR band
+  }
+  
+  return green.subtract(nir).divide(green.add(nir)).rename('NDWI');
+}
+
+// Main processing function
+function processYear(year) {
+  try {
+    var collection = getCollection(year);
+    var count = collection.size();
+    
+    if (count.getInfo() === 0) {
+      print('No data available for year: ' + year);
+      return null;
+    }
+    
+    var img = collection.median().clip(aoi);
+    var ndwi = computeNDWI(img, year);
+    var water = ndwi.gt(year < 1984 ? 0.1 : 0.2).selfMask();
+    
+    var area = water.multiply(ee.Image.pixelArea())
+                   .divide(1e6) // m² → km²
+                   .reduceRegion({
+                     reducer: ee.Reducer.sum(),
+                     geometry: aoi,
+                     scale: year < 1984 ? 60 : 30,
+                     maxPixels: 1e13
+                   }).get('NDWI');
+    
+    return {
+      'year': year,
+      'water_km2': area,
+      'water_img': water,
+      'ndwi_img': ndwi,
+      'has_data': 1
+    };
+  } catch (e) {
+    print('Error processing year ' + year + ': ' + e);
+    return null;
+  }
+}
+
+// Define years to analyze
+var years = [1974, 1984, 1994, 2004, 2014, 2024];
+var results = [];
+
+// Process each year
+years.forEach(function(year) {
+  print('Processing year: ' + year);
+  var result = processYear(year);
+  if (result) {
+    results.push(result);
+  }
+});
+
+if (results.length === 0) {
+  print('No valid results were obtained for any year');
+} else {
+  // Prepare results for display
+  var fc = ee.FeatureCollection(results.map(function(result) {
+    return ee.Feature(null, result);
+  }));
+  
+  // Create a panel to hold all the maps
+  var mapPanel = ui.Panel({style: {height: '600px'}});
+  
+  // Create a map for each year with data
+  results.forEach(function(result) {
+    var year = result.year;
+    var waterImg = result.water_img;
+    
+    // Create a new map
+    var map = ui.Map();
+    map.centerObject(aoi, 6);
+    
+    // Add the water layer
+    map.addLayer(waterImg, {palette: ['blue']}, 'Flood Areas ' + year);
+    
+    // Add the country boundary
+    map.addLayer(aoi, {color: 'red'}, 'Ghana Boundary');
+    
+    // Create a title for the map
+    var title = ui.Label('Flood Detection in Ghana - ' + year, {
+      fontWeight: 'bold',
+      fontSize: '16px',
+      margin: '10px 0 5px 0'
+    });
+    
+    // Create a panel for this year's map
+    var yearPanel = ui.Panel([title, map], null, {
+      width: '45%',
+      margin: '0 10px 10px 0',
+      padding: '5px'
+    });
+    
+    // Add to the main panel
+    mapPanel.add(yearPanel);
+  });
+  
+  // Display the panel with all maps
+  ui.root.widgets().reset([mapPanel]);
+  
+  // Create and display the chart
+  var chartData = fc.filter(ee.Filter.eq('has_data', 1));
+  var chart = ui.Chart.feature.byFeature(chartData, 'year', 'water_km2')
+    .setChartType('ColumnChart')
+    .setOptions({
+      title: 'Flood/Water Area in Ghana (1974-2024)',
+      vAxis: {title: 'Area (km²)'},
+      hAxis: {title: 'Year', format: '####'},
+      colors: ['#1f77b4'],
+      bar: {groupWidth: '80%'}
+    });
+  
+  print('Water/Flood Area Chart');
+  
+  // Export data
+  Export.table.toDrive({
+    collection: fc.select(['year', 'water_km2']),
+    description: 'Ghana_Flood_Area_Summary',
+    fileFormat: 'CSV',
+    fileNamePrefix: 'ghana_flood_summary'
+  });
+  
+  // Export images for each year
+  results.forEach(function(result) {
+    var year = result.year;
+    
+    // Export water mask as GeoTIFF
+    Export.image.toDrive({
+      image: result.water_img,
+      description: 'Ghana_Flood_Mask_' + year,
+      folder: 'Ghana_Flood_Detection',
+      fileNamePrefix: 'ghana_flood_mask_' + year,
+      region: aoi,
+      scale: year < 1984 ? 60 : 30,
+      maxPixels: 1e13,
+      fileFormat: 'GeoTIFF'
+    });
+    
+    // Export NDWI as GeoTIFF
+    Export.image.toDrive({
+      image: result.ndwi_img,
+      description: 'Ghana_NDWI_' + year,
+      folder: 'Ghana_Flood_Detection',
+      fileNamePrefix: 'ghana_ndwi_' + year,
+      region: aoi,
+      scale: year < 1984 ? 60 : 30,
+      maxPixels: 1e13,
+      fileFormat: 'GeoTIFF'
+    });
+  });
+  
+  print('Export tasks created for all years with data');
+}
